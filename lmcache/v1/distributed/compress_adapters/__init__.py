@@ -16,6 +16,7 @@ from lmcache.v1.distributed.compress_adapters.format import (
     crc32_ieee,
     encode_record_header,
     parse_record_header,
+    record_header_size,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "crc32_ieee",
     "encode_record_header",
     "parse_record_header",
+    "record_header_size",
 ]

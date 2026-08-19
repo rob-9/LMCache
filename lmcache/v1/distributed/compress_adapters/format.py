@@ -84,6 +84,28 @@ def crc32_ieee(data: bytes | bytearray | memoryview) -> int:
     return zlib.crc32(view) & _UINT32_MAX
 
 
+def record_header_size(chunk_count: int) -> int:
+    """Return the exact version-1 header size for ``chunk_count`` chunks.
+
+    Args:
+        chunk_count: Number of chunk descriptors in the record.
+
+    Returns:
+        Fixed-header bytes plus the complete descriptor-table size.
+
+    Raises:
+        TypeError: If ``chunk_count`` is not an integer.
+        ValueError: If ``chunk_count`` is outside the version-1 resource
+            bounds.
+    """
+    _require_uint("chunk_count", chunk_count, _UINT32_MAX)
+    if chunk_count > _MAX_RECORD_CHUNKS:
+        raise ValueError(
+            f"chunk_count {chunk_count} exceeds version-1 maximum {_MAX_RECORD_CHUNKS}"
+        )
+    return _FIXED_HEADER.size + chunk_count * _CHUNK_DESCRIPTOR.size
+
+
 def _header_crc32(data: bytes | bytearray | memoryview) -> int:
     header_bytes = bytearray(data)
     struct.pack_into("<I", header_bytes, _HEADER_CRC32_OFFSET, 0)
@@ -309,7 +331,7 @@ class CompressedRecordHeader:
     @property
     def header_size(self) -> int:
         """Return the encoded header size in bytes."""
-        return _FIXED_HEADER.size + len(self.chunks) * _CHUNK_DESCRIPTOR.size
+        return record_header_size(len(self.chunks))
 
     @property
     def uncompressed_size(self) -> int:
