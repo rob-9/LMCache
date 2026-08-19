@@ -23,6 +23,7 @@ from lmcache.v1.distributed.compress_adapters import (
     crc32_ieee,
     encode_record_header,
     parse_record_header,
+    record_header_size,
 )
 
 _V1_ONE_CHUNK_HEADER = bytes.fromhex(
@@ -221,6 +222,26 @@ def test_empty_record_header_round_trip() -> None:
     assert len(encoded) == 40
     assert header.uncompressed_size == 0
     assert parse_record_header(encoded) == header
+
+
+def test_record_header_size_reports_version_1_layout() -> None:
+    """Callers can size a record before constructing its descriptors."""
+    assert record_header_size(0) == 40
+    assert record_header_size(2) == 88
+
+
+def test_record_header_size_enforces_exact_version_1_chunk_boundary() -> None:
+    """The largest 1 MiB table is accepted and one more chunk is rejected."""
+    assert record_header_size(43_689) == MAX_RECORD_HEADER_SIZE
+    with pytest.raises(ValueError, match="exceeds version-1 maximum 43689"):
+        record_header_size(43_690)
+
+
+@pytest.mark.parametrize("chunk_count", [True, -1, 1 << 32])
+def test_record_header_size_rejects_invalid_counts(chunk_count: int) -> None:
+    """Header sizing applies the same integer contract as record parsing."""
+    with pytest.raises((TypeError, ValueError), match="chunk_count"):
+        record_header_size(chunk_count)
 
 
 @pytest.mark.parametrize(
