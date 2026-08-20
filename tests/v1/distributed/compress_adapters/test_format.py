@@ -2,7 +2,8 @@
 """Public-contract tests for portable compression-format identity."""
 
 # Standard
-from dataclasses import FrozenInstanceError
+from collections.abc import Callable
+from dataclasses import FrozenInstanceError, replace
 import struct
 
 # Third Party
@@ -13,6 +14,7 @@ from lmcache.v1.distributed.compress_adapters import (
     MAX_RECORD_HEADER_SIZE,
     RECORD_FORMAT_VERSION,
     RECORD_MAGIC,
+    RECORD_PAYLOAD_ALIGNMENT,
     CompressedChunkDescriptor,
     CompressedRecordFormatError,
     CompressedRecordHeader,
@@ -20,32 +22,43 @@ from lmcache.v1.distributed.compress_adapters import (
     CompressionFraming,
     PostDecompressTransform,
     StoredCompressionFormat,
+    ValidatedCompressedRecord,
+    align_record_payload_offset,
     crc32_ieee,
     encode_record_header,
     parse_record_header,
     record_header_size,
+    validate_complete_record,
 )
 
 _V1_ONE_CHUNK_HEADER = bytes.fromhex(
     "4c4d435201010100"
-    "40000000"
-    "4300000000000000"
+    "44000000"
+    "5300000000000000"
     "0500000000000000"
     "01000000"
-    "abda4916"
+    "a2b8006f"
+    "379bb61d"
     "00000000"
-    "4000000000000000"
+    "5000000000000000"
     "03000000"
     "05000000"
     "86a61036"
     "00000000"
 )
 
+_V1_ONE_CHUNK_PAYLOAD = b"\x00" * 12 + b"abc"
+
 
 def _rewrite_header_crc(encoded: bytearray) -> None:
     """Recompute the draft header checksum after a deliberate mutation."""
     struct.pack_into("<I", encoded, 32, 0)
     struct.pack_into("<I", encoded, 32, crc32_ieee(encoded))
+
+
+def _sample_payload() -> bytes:
+    """Return canonical padding and payload bytes for ``_sample_header``."""
+    return b"\x00" * 4 + b"abcd" + b"\x00" * 12 + b"xyz"
 
 
 def _sample_header() -> CompressedRecordHeader:
@@ -57,19 +70,20 @@ def _sample_header() -> CompressedRecordHeader:
         ),
         chunks=(
             CompressedChunkDescriptor(
-                payload_offset=88,
+                payload_offset=96,
                 compressed_size=4,
-                uncompressed_size=8,
+                uncompressed_size=16,
                 uncompressed_crc32=0x12345678,
             ),
             CompressedChunkDescriptor(
-                payload_offset=96,
+                payload_offset=112,
                 compressed_size=3,
                 uncompressed_size=5,
                 uncompressed_crc32=0x90ABCDEF,
             ),
         ),
-        record_size=99,
+        record_size=115,
+        compressed_payload_crc32=crc32_ieee(_sample_payload()),
     )
 
 
@@ -137,7 +151,7 @@ def test_record_header_round_trip_is_deterministic() -> None:
     encoded_twice = encode_record_header(header)
 
     assert encoded_once == encoded_twice
-    assert len(encoded_once) == header.header_size == 88
+    assert len(encoded_once) == header.header_size == 92
     assert encoded_once[:4] == RECORD_MAGIC
     assert encoded_once[4] == RECORD_FORMAT_VERSION
     assert parse_record_header(encoded_once) == header
@@ -152,17 +166,119 @@ def test_v1_wire_format_matches_frozen_vector() -> None:
         ),
         chunks=(
             CompressedChunkDescriptor(
-                payload_offset=64,
+                payload_offset=80,
                 compressed_size=3,
                 uncompressed_size=5,
                 uncompressed_crc32=0x3610A686,
             ),
         ),
-        record_size=67,
+        record_size=83,
+        compressed_payload_crc32=crc32_ieee(_V1_ONE_CHUNK_PAYLOAD),
     )
 
     assert encode_record_header(header) == _V1_ONE_CHUNK_HEADER
     assert parse_record_header(_V1_ONE_CHUNK_HEADER) == header
+
+
+def test_complete_record_validation_retains_immutable_bytes() -> None:
+    """Full validation promotes exact bytes beyond header-only metadata."""
+    record = _V1_ONE_CHUNK_HEADER + _V1_ONE_CHUNK_PAYLOAD
+
+    validated = validate_complete_record(record)
+
+    assert isinstance(validated, ValidatedCompressedRecord)
+    assert validated.header == parse_record_header(record)
+    assert type(validated.record_bytes) is bytes
+    assert validated.record_bytes is record
+
+
+def test_complete_record_validation_rejects_payload_checksum_mismatch() -> None:
+    """Corrupt stored bytes fail before a caller may submit native decoding."""
+    record = bytearray(_V1_ONE_CHUNK_HEADER + _V1_ONE_CHUNK_PAYLOAD)
+    record[-1] ^= 1
+
+    with pytest.raises(
+        CompressedRecordFormatError,
+        match="compressed payload CRC-32/IEEE mismatch",
+    ):
+        validate_complete_record(bytes(record))
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda record: record[:-1], "truncated record"),
+        (lambda record: record + b"extra", "trailing bytes after record"),
+    ],
+)
+def test_complete_record_validation_requires_exact_length(
+    change: Callable[[bytes], bytes],
+    message: str,
+) -> None:
+    """The public validator consumes exactly one complete record."""
+    record = _V1_ONE_CHUNK_HEADER + _V1_ONE_CHUNK_PAYLOAD
+
+    with pytest.raises(CompressedRecordFormatError, match=message):
+        validate_complete_record(change(record))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        bytearray(_V1_ONE_CHUNK_HEADER + _V1_ONE_CHUNK_PAYLOAD),
+        memoryview(_V1_ONE_CHUNK_HEADER + _V1_ONE_CHUNK_PAYLOAD),
+        memoryview(_V1_ONE_CHUNK_HEADER + _V1_ONE_CHUNK_PAYLOAD)[::2],
+    ],
+)
+def test_complete_record_validation_rejects_mutable_or_aliased_input(
+    data: bytearray | memoryview,
+) -> None:
+    """Public validation rejects aliased buffers before parsing or copying."""
+    with pytest.raises(TypeError, match="data must be immutable bytes"):
+        validate_complete_record(data)  # type: ignore[arg-type]
+
+
+def test_validated_record_bytes_remain_stable_for_repeated_consumers() -> None:
+    """The stored public bytes cannot be released between later consumers."""
+    record = _V1_ONE_CHUNK_HEADER + _V1_ONE_CHUNK_PAYLOAD
+    validated = validate_complete_record(record)
+
+    first_consumer = memoryview(validated.record_bytes)
+    first_consumer.release()
+
+    assert memoryview(validated.record_bytes).tobytes() == record
+
+
+def test_validated_record_is_immutable() -> None:
+    """Callers cannot replace metadata after full validation."""
+    record = _V1_ONE_CHUNK_HEADER + _V1_ONE_CHUNK_PAYLOAD
+    validated = validate_complete_record(record)
+
+    with pytest.raises(FrozenInstanceError):
+        validated.header = _sample_header()  # type: ignore[misc]
+
+
+def test_header_crc_protects_compressed_payload_checksum() -> None:
+    """Changing the expected payload checksum invalidates the header first."""
+    record = bytearray(_V1_ONE_CHUNK_HEADER + _V1_ONE_CHUNK_PAYLOAD)
+    record[36] ^= 1
+
+    with pytest.raises(CompressedRecordFormatError, match="header CRC-32/IEEE"):
+        validate_complete_record(bytes(record))
+
+
+def test_complete_record_validation_rejects_nonzero_padding() -> None:
+    """Checksum-valid alignment gaps still require deterministic zero bytes."""
+    payload = bytearray(_sample_payload())
+    payload[0] = 1
+    header = replace(
+        _sample_header(),
+        compressed_payload_crc32=crc32_ieee(payload),
+    )
+    record = encode_record_header(header) + bytes(payload)
+
+    with pytest.raises(CompressedRecordFormatError, match="non-zero alignment"):
+        validate_complete_record(record)
 
 
 def test_header_rejects_invalid_chunk_element_with_type_error() -> None:
@@ -179,8 +295,16 @@ def test_header_rejects_invalid_chunk_element_with_type_error() -> None:
         CompressedRecordHeader(
             stored_format=stored_format,
             chunks=(object(),),  # type: ignore[arg-type]
-            record_size=64,
+            record_size=68,
+            compressed_payload_crc32=0,
         )
+
+
+@pytest.mark.parametrize("checksum", [True, 1 << 32])
+def test_header_rejects_invalid_compressed_payload_checksum(checksum: int) -> None:
+    """Compressed-payload checksums use unsigned non-boolean wire integers."""
+    with pytest.raises((TypeError, ValueError), match="compressed_payload_crc32"):
+        replace(_sample_header(), compressed_payload_crc32=checksum)
 
 
 def test_crc32_ieee_matches_the_standard_check_value() -> None:
@@ -214,27 +338,45 @@ def test_empty_record_header_round_trip() -> None:
             framing=CompressionFraming.GZIP,
         ),
         chunks=(),
-        record_size=40,
+        record_size=44,
+        compressed_payload_crc32=crc32_ieee(b""),
     )
 
     encoded = encode_record_header(header)
 
-    assert len(encoded) == 40
+    assert len(encoded) == 44
     assert header.uncompressed_size == 0
     assert parse_record_header(encoded) == header
+    assert validate_complete_record(encoded).header == header
 
 
 def test_record_header_size_reports_version_1_layout() -> None:
     """Callers can size a record before constructing its descriptors."""
-    assert record_header_size(0) == 40
-    assert record_header_size(2) == 88
+    assert record_header_size(0) == 44
+    assert record_header_size(2) == 92
 
 
-def test_record_header_size_enforces_exact_version_1_chunk_boundary() -> None:
-    """The largest 1 MiB table is accepted and one more chunk is rejected."""
-    assert record_header_size(43_689) == MAX_RECORD_HEADER_SIZE
-    with pytest.raises(ValueError, match="exceeds version-1 maximum 43689"):
-        record_header_size(43_690)
+@pytest.mark.parametrize(
+    ("offset", "aligned"),
+    [(0, 0), (68, 80), (80, 80), (81, 96)],
+)
+def test_record_payload_offset_alignment(offset: int, aligned: int) -> None:
+    """Payload producers share the format's canonical alignment calculation."""
+    assert align_record_payload_offset(offset) == aligned
+
+
+@pytest.mark.parametrize("offset", [True, -1, (1 << 64) - 1])
+def test_record_payload_offset_alignment_rejects_invalid_values(offset: int) -> None:
+    """Alignment rejects invalid types, negative offsets, and overflow."""
+    with pytest.raises((TypeError, ValueError), match="offset"):
+        align_record_payload_offset(offset)
+
+
+def test_record_header_size_enforces_version_1_chunk_boundary() -> None:
+    """The largest sub-1-MiB table is accepted and one more is rejected."""
+    assert record_header_size(43_688) == MAX_RECORD_HEADER_SIZE - 20
+    with pytest.raises(ValueError, match="exceeds version-1 maximum 43688"):
+        record_header_size(43_689)
 
 
 @pytest.mark.parametrize("chunk_count", [True, -1, 1 << 32])
@@ -268,7 +410,7 @@ def test_parser_rejects_unknown_fixed_header_values(
         parse_record_header(encoded)
 
 
-@pytest.mark.parametrize("size", [0, 1, 39, 87])
+@pytest.mark.parametrize("size", [0, 1, 43, 91])
 def test_parser_rejects_truncated_headers(size: int) -> None:
     """Both the fixed header and descriptor table must be complete."""
     encoded = encode_record_header(_sample_header())
@@ -289,21 +431,30 @@ def test_parser_rejects_inconsistent_header_size() -> None:
 def test_parser_rejects_chunk_beyond_record_size() -> None:
     """A descriptor cannot address bytes beyond the declared record."""
     encoded = bytearray(encode_record_header(_sample_header()))
-    struct.pack_into("<Q", encoded, 12, 98)
+    struct.pack_into("<Q", encoded, 12, 114)
     _rewrite_header_crc(encoded)
 
     with pytest.raises(CompressedRecordFormatError, match="beyond record_size"):
         parse_record_header(encoded)
 
 
-def test_parser_rejects_overlapping_chunks() -> None:
-    """Ordered descriptors may contain alignment gaps but cannot overlap."""
+def test_parser_rejects_noncanonical_payload_offset() -> None:
+    """Descriptor offsets must use the next minimal aligned address."""
     encoded = bytearray(encode_record_header(_sample_header()))
-    struct.pack_into("<Q", encoded, 64, 91)
+    struct.pack_into("<Q", encoded, 68, 111)
     _rewrite_header_crc(encoded)
 
-    with pytest.raises(CompressedRecordFormatError, match="overlaps"):
+    with pytest.raises(CompressedRecordFormatError, match="canonical 16-byte"):
         parse_record_header(encoded)
+
+
+def test_header_rejects_unaligned_nonfinal_output_size() -> None:
+    """Prefix-sum output ranges remain aligned after every non-final chunk."""
+    header = _sample_header()
+    first = replace(header.chunks[0], uncompressed_size=15)
+
+    with pytest.raises(ValueError, match="not divisible by 16"):
+        replace(header, chunks=(first, header.chunks[1]))
 
 
 def test_parser_rejects_inconsistent_uncompressed_total() -> None:
@@ -322,7 +473,7 @@ def test_parser_rejects_inconsistent_uncompressed_total() -> None:
 def test_parser_rejects_reserved_chunk_flags() -> None:
     """Unknown per-chunk flags are rejected instead of silently ignored."""
     encoded = bytearray(encode_record_header(_sample_header()))
-    struct.pack_into("<I", encoded, 60, 1)
+    struct.pack_into("<I", encoded, 64, 1)
     _rewrite_header_crc(encoded)
 
     with pytest.raises(CompressedRecordFormatError, match="unsupported flags"):
@@ -332,7 +483,7 @@ def test_parser_rejects_reserved_chunk_flags() -> None:
 def test_parser_rejects_reserved_header_flags() -> None:
     """Unknown fixed-header flags are rejected instead of silently ignored."""
     encoded = bytearray(encode_record_header(_sample_header()))
-    struct.pack_into("<I", encoded, 36, 1)
+    struct.pack_into("<I", encoded, 40, 1)
     _rewrite_header_crc(encoded)
 
     with pytest.raises(CompressedRecordFormatError, match="header uses unsupported"):
@@ -347,11 +498,12 @@ def test_parser_rejects_impractical_chunk_table() -> None:
             framing=CompressionFraming.RAW,
         ),
         chunks=(),
-        record_size=40,
+        record_size=44,
+        compressed_payload_crc32=0,
     )
     encoded = bytearray(encode_record_header(header))
-    excessive_chunk_count = (MAX_RECORD_HEADER_SIZE - 40) // 24 + 1
-    struct.pack_into("<I", encoded, 8, 40 + excessive_chunk_count * 24)
+    excessive_chunk_count = (MAX_RECORD_HEADER_SIZE - 44) // 24 + 1
+    struct.pack_into("<I", encoded, 8, 44 + excessive_chunk_count * 24)
     struct.pack_into("<I", encoded, 28, excessive_chunk_count)
 
     with pytest.raises(CompressedRecordFormatError, match="exceeds version-1"):
@@ -386,10 +538,14 @@ def test_chunk_descriptor_validates_wire_ranges(
         CompressedChunkDescriptor(**kwargs)
 
 
-def test_header_allows_alignment_gaps_between_chunks() -> None:
-    """Payload alignment padding does not become part of a chunk."""
+def test_header_uses_canonical_alignment_gaps_between_chunks() -> None:
+    """Payload offsets use minimal alignment without including padding."""
     header = _sample_header()
 
-    assert header.chunks[0].payload_offset + header.chunks[0].compressed_size == 92
-    assert header.chunks[1].payload_offset == 96
+    assert header.header_size == 92
+    assert header.chunks[0].payload_offset == 96
+    assert header.chunks[0].payload_offset % RECORD_PAYLOAD_ALIGNMENT == 0
+    assert header.chunks[0].payload_offset + header.chunks[0].compressed_size == 100
+    assert header.chunks[1].payload_offset == 112
+    assert header.chunks[1].payload_offset % RECORD_PAYLOAD_ALIGNMENT == 0
     assert parse_record_header(encode_record_header(header)) == header

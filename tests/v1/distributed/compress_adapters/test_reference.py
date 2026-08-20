@@ -11,15 +11,18 @@ import pytest
 
 # First Party
 from lmcache.v1.distributed.compress_adapters import (
+    RECORD_PAYLOAD_ALIGNMENT,
     CompressedChunkDescriptor,
     CompressedRecordFormatError,
     CompressedRecordHeader,
     CompressionCodec,
     CompressionFraming,
     StoredCompressionFormat,
+    align_record_payload_offset,
     crc32_ieee,
     encode_record_header,
     parse_record_header,
+    record_header_size,
 )
 from lmcache.v1.distributed.compress_adapters.reference import (
     decode_reference_record,
@@ -29,33 +32,37 @@ import lmcache.v1.distributed.compress_adapters as compress_adapters
 
 _V1_RAW_DEFLATE_HELLO_RECORD = bytes.fromhex(
     "4c4d435201010100"
-    "40000000"
-    "4700000000000000"
+    "44000000"
+    "5700000000000000"
     "0500000000000000"
     "01000000"
-    "59603abe"
+    "5c9845f7"
+    "f13ce63c"
     "00000000"
-    "4000000000000000"
+    "5000000000000000"
     "07000000"
     "05000000"
     "86a61036"
     "00000000"
+    "000000000000000000000000"
     "cb48cdc9c90700"
 )
 
 _V1_GZIP_HELLO_RECORD = bytes.fromhex(
     "4c4d435201010200"
-    "40000000"
-    "5900000000000000"
+    "44000000"
+    "6900000000000000"
     "0500000000000000"
     "01000000"
-    "c985f2da"
+    "37c8471e"
+    "ae032f78"
     "00000000"
-    "4000000000000000"
+    "5000000000000000"
     "19000000"
     "05000000"
     "86a61036"
     "00000000"
+    "000000000000000000000000"
     "1f8b08000000000000ffcb48cdc9c9070086a6103605000000"
 )
 
@@ -81,19 +88,23 @@ def _one_chunk_record(
     uncompressed_crc32: int,
 ) -> bytes:
     """Wrap an explicit raw Deflate payload in public record metadata."""
+    header_size = record_header_size(1)
+    payload_offset = align_record_payload_offset(header_size)
+    payload = b"\x00" * (payload_offset - header_size) + compressed
     header = CompressedRecordHeader(
         stored_format=_stored_format(CompressionFraming.RAW),
         chunks=(
             CompressedChunkDescriptor(
-                payload_offset=64,
+                payload_offset=payload_offset,
                 compressed_size=len(compressed),
                 uncompressed_size=uncompressed_size,
                 uncompressed_crc32=uncompressed_crc32,
             ),
         ),
-        record_size=64 + len(compressed),
+        record_size=payload_offset + len(compressed),
+        compressed_payload_crc32=crc32_ieee(payload),
     )
-    return encode_record_header(header) + compressed
+    return encode_record_header(header) + payload
 
 
 def test_reference_helpers_are_not_package_root_api() -> None:
@@ -115,7 +126,7 @@ def test_reference_record_round_trip(framing: CompressionFraming) -> None:
     encoded = encode_reference_record(
         original,
         stored_format=_stored_format(framing),
-        chunk_size=127,
+        chunk_size=128,
     )
 
     assert (
@@ -139,15 +150,16 @@ def test_encoder_produces_independent_standard_streams(
     wbits: int,
 ) -> None:
     """Every descriptor addresses one independently decodable stream."""
-    original = b"abcdefghijkl"
+    original = b"abcdefghijklmnopqrstuvwxyz0123456789"
     encoded = encode_reference_record(
         original,
         stored_format=_stored_format(framing),
-        chunk_size=5,
+        chunk_size=16,
     )
     header = parse_record_header(encoded)
 
-    assert [chunk.uncompressed_size for chunk in header.chunks] == [5, 5, 2]
+    assert [chunk.uncompressed_size for chunk in header.chunks] == [16, 16, 4]
+    assert header.compressed_payload_crc32 == crc32_ieee(encoded[header.header_size :])
     decoded_chunks = [
         zlib.decompress(
             encoded[
@@ -157,10 +169,26 @@ def test_encoder_produces_independent_standard_streams(
         )
         for chunk in header.chunks
     ]
-    assert decoded_chunks == [b"abcde", b"fghij", b"kl"]
-    assert header.chunks[0].payload_offset == header.header_size
+    assert decoded_chunks == [b"abcdefghijklmnop", b"qrstuvwxyz012345", b"6789"]
+    assert header.chunks[0].payload_offset == align_record_payload_offset(
+        header.header_size
+    )
+    assert encoded[header.header_size : header.chunks[0].payload_offset] == b"\x00" * (
+        header.chunks[0].payload_offset - header.header_size
+    )
     assert all(
-        current.payload_offset + current.compressed_size == following.payload_offset
+        chunk.payload_offset % RECORD_PAYLOAD_ALIGNMENT == 0 for chunk in header.chunks
+    )
+    assert all(
+        chunk.uncompressed_size % RECORD_PAYLOAD_ALIGNMENT == 0
+        for chunk in header.chunks[:-1]
+    )
+    assert all(
+        encoded[
+            current.payload_offset + current.compressed_size : following.payload_offset
+        ]
+        == b"\x00"
+        * (following.payload_offset - current.payload_offset - current.compressed_size)
         for current, following in zip(
             header.chunks,
             header.chunks[1:],
@@ -179,7 +207,7 @@ def test_empty_input_uses_a_descriptor_free_record() -> None:
 
     header = parse_record_header(encoded)
     assert header.chunks == ()
-    assert header.record_size == header.header_size == len(encoded) == 40
+    assert header.record_size == header.header_size == len(encoded) == 44
     assert decode_reference_record(encoded, expected_uncompressed_size=0) == b""
 
 
@@ -237,6 +265,25 @@ def test_decoder_requires_caller_output_size_argument() -> None:
     with pytest.raises(TypeError, match="expected_uncompressed_size"):
         decode_reference_record(  # type: ignore[call-arg]
             _V1_RAW_DEFLATE_HELLO_RECORD,
+        )
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        bytearray(_V1_RAW_DEFLATE_HELLO_RECORD),
+        memoryview(_V1_RAW_DEFLATE_HELLO_RECORD),
+        memoryview(_V1_RAW_DEFLATE_HELLO_RECORD)[::2],
+    ],
+)
+def test_decoder_rejects_mutable_or_aliased_record_input(
+    record: bytearray | memoryview,
+) -> None:
+    """Reference decoding inherits the immutable validated-record boundary."""
+    with pytest.raises(TypeError, match="data must be immutable bytes"):
+        decode_reference_record(  # type: ignore[arg-type]
+            record,
+            expected_uncompressed_size=5,
         )
 
 
@@ -349,7 +396,7 @@ def test_decoder_rejects_chunk_crc_mismatch() -> None:
         decode_reference_record(record, expected_uncompressed_size=5)
 
 
-@pytest.mark.parametrize("chunk_size", [True, 0, -1, 1 << 32])
+@pytest.mark.parametrize("chunk_size", [True, 0, -1, 15, 17, 1 << 32])
 def test_encoder_rejects_invalid_chunk_size(chunk_size: int) -> None:
     """Chunk sizing rejects booleans and values outside descriptor widths."""
     with pytest.raises((TypeError, ValueError), match="chunk_size"):
@@ -380,20 +427,13 @@ def test_encoder_rejects_untyped_stored_format() -> None:
         )
 
 
-@pytest.mark.parametrize("operation", ["encode", "decode"])
-def test_reference_codec_rejects_noncontiguous_input(operation: str) -> None:
-    """Both public operations require one contiguous byte buffer."""
+def test_reference_encoder_rejects_noncontiguous_input() -> None:
+    """Reference encoding requires one contiguous source byte range."""
     noncontiguous = memoryview(b"abcdef")[::2]
 
     with pytest.raises(TypeError, match="contiguous byte buffer"):
-        if operation == "encode":
-            encode_reference_record(
-                noncontiguous,
-                stored_format=_stored_format(CompressionFraming.RAW),
-                chunk_size=3,
-            )
-        else:
-            decode_reference_record(
-                noncontiguous,
-                expected_uncompressed_size=3,
-            )
+        encode_reference_record(
+            noncontiguous,
+            stored_format=_stored_format(CompressionFraming.RAW),
+            chunk_size=16,
+        )
