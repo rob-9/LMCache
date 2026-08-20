@@ -13,6 +13,7 @@ import zlib
 
 # First Party
 from lmcache.v1.distributed.compress_adapters.format import (
+    RECORD_PAYLOAD_ALIGNMENT,
     CompressedChunkDescriptor,
     CompressedRecordFormatError,
     CompressedRecordHeader,
@@ -20,10 +21,11 @@ from lmcache.v1.distributed.compress_adapters.format import (
     CompressionFraming,
     PostDecompressTransform,
     StoredCompressionFormat,
+    align_record_payload_offset,
     crc32_ieee,
     encode_record_header,
-    parse_record_header,
     record_header_size,
+    validate_complete_record,
 )
 
 _UINT32_MAX = (1 << 32) - 1
@@ -45,6 +47,11 @@ def _require_chunk_size(chunk_size: int) -> None:
         raise TypeError(f"chunk_size must be an int, got {type(chunk_size).__name__}")
     if chunk_size <= 0 or chunk_size > _UINT32_MAX:
         raise ValueError(f"chunk_size must be in [1, {_UINT32_MAX}], got {chunk_size}")
+    if chunk_size % RECORD_PAYLOAD_ALIGNMENT != 0:
+        raise ValueError(
+            f"chunk_size must be divisible by {RECORD_PAYLOAD_ALIGNMENT}, "
+            f"got {chunk_size}"
+        )
 
 
 def _require_expected_uncompressed_size(expected_uncompressed_size: int) -> None:
@@ -168,11 +175,13 @@ def encode_reference_record(
             Gzip framing and no post-decompression transform.
         chunk_size: Maximum uncompressed bytes in each independent stream.
             This value is required so the reference layer does not establish a
-            production chunk-size default prematurely.
+            production chunk-size default prematurely. It must be divisible by
+            :data:`RECORD_PAYLOAD_ALIGNMENT`; only the final input chunk may
+            contain fewer bytes.
 
     Returns:
         A complete record containing its header, descriptor table, and
-        contiguous compressed payload chunks.
+        canonically aligned compressed payload chunks.
 
     Raises:
         TypeError: If an argument has the wrong type or ``data`` is not a
@@ -202,8 +211,12 @@ def encode_reference_record(
     ]
 
     descriptors: list[CompressedChunkDescriptor] = []
+    payload_parts: list[bytes] = []
     payload_offset = header_size
     for index, compressed in enumerate(compressed_chunks):
+        aligned_payload_offset = align_record_payload_offset(payload_offset)
+        payload_parts.append(b"\x00" * (aligned_payload_offset - payload_offset))
+        payload_offset = aligned_payload_offset
         uncompressed = view[index * chunk_size : (index + 1) * chunk_size]
         descriptors.append(
             CompressedChunkDescriptor(
@@ -213,25 +226,28 @@ def encode_reference_record(
                 uncompressed_crc32=crc32_ieee(uncompressed),
             )
         )
+        payload_parts.append(compressed)
         payload_offset += len(compressed)
 
+    payload = b"".join(payload_parts)
     header = CompressedRecordHeader(
         stored_format=stored_format,
         chunks=tuple(descriptors),
         record_size=payload_offset,
+        compressed_payload_crc32=crc32_ieee(payload),
     )
-    return encode_record_header(header) + b"".join(compressed_chunks)
+    return encode_record_header(header) + payload
 
 
 def decode_reference_record(
-    data: bytes | bytearray | memoryview,
+    data: bytes,
     *,
     expected_uncompressed_size: int,
 ) -> bytes:
     """Validate and CPU-decode one complete portable compressed record.
 
     Args:
-        data: Exact bytes of one complete portable record.
+        data: Immutable bytes containing exactly one complete portable record.
         expected_uncompressed_size: Exact decoded byte count required by the
             caller's logical KV layout. This mandatory value prevents record
             metadata from choosing an unbounded allocation size.
@@ -240,8 +256,8 @@ def decode_reference_record(
         The concatenated uncompressed chunk bytes.
 
     Raises:
-        TypeError: If an argument has the wrong type or ``data`` is not a
-            contiguous byte buffer.
+        TypeError: If an argument has the wrong type or ``data`` is not
+            immutable :class:`bytes`.
         ValueError: If ``expected_uncompressed_size`` is negative.
         CompressedRecordFormatError: If metadata or payload bytes are invalid,
             the buffer is not exactly one record, its advertised output size
@@ -253,19 +269,10 @@ def decode_reference_record(
         output size and compressed input is supplied to zlib in bounded
         windows. This function intentionally does not apply a post-transform.
     """
-    view = _as_byte_view("data", data)
     _require_expected_uncompressed_size(expected_uncompressed_size)
-    header = parse_record_header(view)
-
-    if view.nbytes < header.record_size:
-        raise CompressedRecordFormatError(
-            f"truncated record: got {view.nbytes} bytes, expected {header.record_size}"
-        )
-    if view.nbytes > header.record_size:
-        raise CompressedRecordFormatError(
-            f"trailing bytes after record: got {view.nbytes} bytes, expected "
-            f"{header.record_size}"
-        )
+    validated_record = validate_complete_record(data)
+    header = validated_record.header
+    view = memoryview(validated_record.record_bytes)
     if header.uncompressed_size != expected_uncompressed_size:
         raise CompressedRecordFormatError(
             f"record advertises {header.uncompressed_size} uncompressed bytes, "

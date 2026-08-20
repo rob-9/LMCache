@@ -9,10 +9,11 @@ descriptors do not become part of the stored-format identity.
 The draft binary header is little-endian and contains no vendor/runtime data.
 It describes independently decompressible payload chunks by absolute record
 offset, compressed size, expected output size, and CRC-32/IEEE of the
-uncompressed bytes. The header has its own CRC-32/IEEE covering the fixed
-header and complete chunk table, with the checksum field zeroed while the
-checksum is computed. Payload compression is intentionally outside this
-module.
+uncompressed bytes. The header also carries CRC-32/IEEE of the complete stored
+payload region so callers can detect accidental corruption before native
+decompression. The header has its own CRC-32/IEEE covering the fixed header and
+complete chunk table, with the header-checksum field zeroed while that checksum
+is computed. Payload compression is intentionally outside this module.
 
 Version 1 readers require the declared header size to exactly equal the fixed
 header plus its chunk descriptors. Adding, removing, or resizing fields
@@ -35,21 +36,25 @@ RECORD_FORMAT_VERSION = 1
 MAX_RECORD_HEADER_SIZE = 1 << 20
 """Maximum accepted version-1 header size (1 MiB)."""
 
+RECORD_PAYLOAD_ALIGNMENT = 16
+"""Required byte alignment for every version-1 compressed payload."""
+
 _UINT8_MAX = (1 << 8) - 1
 _UINT32_MAX = (1 << 32) - 1
 _UINT64_MAX = (1 << 64) - 1
 
-# 40 bytes:
+# 44 bytes:
 # magic, version, codec, framing, transform, header size, record size,
-# total uncompressed size, chunk count, header CRC32, reserved flags.
-_FIXED_HEADER = struct.Struct("<4sBBBBIQQIII")
+# total uncompressed size, chunk count, header CRC32, compressed-payload CRC32,
+# reserved flags.
+_FIXED_HEADER = struct.Struct("<4sBBBBIQQIIII")
 
 # 24 bytes per chunk:
 # payload offset, compressed size, uncompressed size, uncompressed CRC32,
 # reserved flags.
 _CHUNK_DESCRIPTOR = struct.Struct("<QIIII")
 
-assert _FIXED_HEADER.size == 40
+assert _FIXED_HEADER.size == 44
 assert _CHUNK_DESCRIPTOR.size == 24
 
 _HEADER_CRC32_OFFSET = 32
@@ -82,6 +87,31 @@ def crc32_ieee(data: bytes | bytearray | memoryview) -> int:
     except (TypeError, ValueError) as exc:
         raise TypeError("data must expose a contiguous byte buffer") from exc
     return zlib.crc32(view) & _UINT32_MAX
+
+
+def align_record_payload_offset(offset: int) -> int:
+    """Round ``offset`` up to the version-1 payload alignment.
+
+    Args:
+        offset: Nonnegative record-relative byte offset.
+
+    Returns:
+        The smallest aligned offset greater than or equal to ``offset``.
+
+    Raises:
+        TypeError: If ``offset`` is not an integer.
+        ValueError: If ``offset`` or its aligned result is outside the
+            unsigned 64-bit record-offset range.
+    """
+    _require_uint("offset", offset, _UINT64_MAX)
+    aligned = (
+        (offset + RECORD_PAYLOAD_ALIGNMENT - 1) // RECORD_PAYLOAD_ALIGNMENT
+    ) * RECORD_PAYLOAD_ALIGNMENT
+    if aligned > _UINT64_MAX:
+        raise ValueError(
+            f"aligned offset {aligned} exceeds unsigned 64-bit maximum {_UINT64_MAX}"
+        )
+    return aligned
 
 
 def record_header_size(chunk_count: int) -> int:
@@ -238,6 +268,8 @@ class CompressedRecordHeader:
         stored_format: Backend-independent codec, framing, and transform.
         chunks: Ordered compressed-payload descriptors.
         record_size: Exact total bytes in the header and payload record.
+        compressed_payload_crc32: Unsigned CRC-32/IEEE of every stored byte in
+            ``[header_size, record_size)``. This includes alignment gaps.
         version: Portable-record version. Defaults to the current draft
             version.
 
@@ -246,16 +278,19 @@ class CompressedRecordHeader:
         ValueError: If sizes, offsets, ordering, or the version are invalid.
 
     Notes:
-        Gaps between payload chunks are allowed for alignment. Chunks must be
-        ordered, non-overlapping, and the final chunk must end at
-        ``record_size``. An empty record has no chunks and consists only of the
-        fixed header. Version 1 headers cannot exceed
-        :data:`MAX_RECORD_HEADER_SIZE`.
+        Payloads use canonical minimal gaps required by
+        :data:`RECORD_PAYLOAD_ALIGNMENT`; complete-record validation requires
+        those gaps to contain only zero bytes. Every non-final chunk's expected
+        output size is also alignment-sized so prefix-sum output ranges stay
+        aligned. The final chunk must end at ``record_size``. An empty record
+        has no chunks and consists only of the fixed header. Version 1 headers
+        cannot exceed :data:`MAX_RECORD_HEADER_SIZE`.
     """
 
     stored_format: StoredCompressionFormat
     chunks: tuple[CompressedChunkDescriptor, ...]
     record_size: int
+    compressed_payload_crc32: int
     version: int = RECORD_FORMAT_VERSION
 
     def __post_init__(self) -> None:
@@ -279,6 +314,11 @@ class CompressedRecordHeader:
                 f"expected {RECORD_FORMAT_VERSION}"
             )
         _require_uint("record_size", self.record_size, _UINT64_MAX)
+        _require_uint(
+            "compressed_payload_crc32",
+            self.compressed_payload_crc32,
+            _UINT32_MAX,
+        )
         _require_uint("chunk_count", len(self.chunks), _UINT32_MAX)
         _require_uint("header_size", self.header_size, _UINT32_MAX)
         _require_uint("uncompressed_size", self.uncompressed_size, _UINT64_MAX)
@@ -301,13 +341,22 @@ class CompressedRecordHeader:
 
         previous_end = self.header_size
         for index, chunk in enumerate(self.chunks):
-            if chunk.payload_offset < self.header_size:
+            expected_payload_offset = align_record_payload_offset(previous_end)
+            if chunk.payload_offset != expected_payload_offset:
                 raise ValueError(
                     f"chunks[{index}] payload_offset {chunk.payload_offset} "
-                    f"is before header_size {self.header_size}"
+                    f"does not match canonical {RECORD_PAYLOAD_ALIGNMENT}-byte "
+                    f"aligned offset {expected_payload_offset}"
                 )
-            if chunk.payload_offset < previous_end:
-                raise ValueError(f"chunks[{index}] overlaps the preceding chunk")
+            if (
+                index < len(self.chunks) - 1
+                and chunk.uncompressed_size % RECORD_PAYLOAD_ALIGNMENT != 0
+            ):
+                raise ValueError(
+                    f"chunks[{index}] uncompressed_size "
+                    f"{chunk.uncompressed_size} is not divisible by "
+                    f"{RECORD_PAYLOAD_ALIGNMENT} for a non-final chunk"
+                )
             chunk_end = chunk.payload_offset + chunk.compressed_size
             if chunk_end > self.record_size:
                 raise ValueError(
@@ -379,6 +428,7 @@ def encode_record_header(header: CompressedRecordHeader) -> bytes:
         header.uncompressed_size,
         len(header.chunks),
         0,
+        header.compressed_payload_crc32,
         0,
     )
     header_crc32 = crc32_ieee(fixed_header + descriptor_bytes)
@@ -393,6 +443,7 @@ def encode_record_header(header: CompressedRecordHeader) -> bytes:
         header.uncompressed_size,
         len(header.chunks),
         header_crc32,
+        header.compressed_payload_crc32,
         0,
     )
     return fixed_header + descriptor_bytes
@@ -444,6 +495,7 @@ def parse_record_header(
         declared_uncompressed_size,
         chunk_count,
         declared_header_crc32,
+        compressed_payload_crc32,
         header_flags,
     ) = _FIXED_HEADER.unpack_from(view)
 
@@ -533,6 +585,7 @@ def parse_record_header(
             ),
             chunks=tuple(chunks),
             record_size=record_size,
+            compressed_payload_crc32=compressed_payload_crc32,
             version=version,
         )
     except CompressedRecordFormatError:
@@ -546,3 +599,90 @@ def parse_record_header(
             f"match chunk total {header.uncompressed_size}"
         )
     return header
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ValidatedCompressedRecord:
+    """Complete portable record whose stored payload checksum is valid.
+
+    Args:
+        data: Exact bytes of one complete portable record.
+
+    Raises:
+        TypeError: If ``data`` is not immutable :class:`bytes`.
+        CompressedRecordFormatError: If metadata is invalid, the supplied
+            length differs from ``record_size``, or the compressed-payload
+            checksum does not match.
+
+    Notes:
+        The immutable input is retained without copying so the validated value
+        cannot change or be invalidated after validation. A future zero-copy
+        L1 path requires a separate guard that retains the source object's read
+        lock for the complete native-use lifetime.
+
+        CRC-32 detects accidental corruption; it does not authenticate a
+        record from an attacker-controlled writer.
+    """
+
+    header: CompressedRecordHeader
+    record_bytes: bytes
+
+    def __init__(self, data: bytes) -> None:
+        if not isinstance(data, bytes):
+            raise TypeError(f"data must be immutable bytes, got {type(data).__name__}")
+        view = memoryview(data)
+
+        header = parse_record_header(view)
+        if view.nbytes < header.record_size:
+            raise CompressedRecordFormatError(
+                f"truncated record: got {view.nbytes} bytes, expected "
+                f"{header.record_size}"
+            )
+        if view.nbytes > header.record_size:
+            raise CompressedRecordFormatError(
+                f"trailing bytes after record: got {view.nbytes} bytes, expected "
+                f"{header.record_size}"
+            )
+
+        computed_payload_crc32 = crc32_ieee(view[header.header_size :])
+        if computed_payload_crc32 != header.compressed_payload_crc32:
+            raise CompressedRecordFormatError(
+                "compressed payload CRC-32/IEEE mismatch: stored "
+                f"0x{header.compressed_payload_crc32:08x}, computed "
+                f"0x{computed_payload_crc32:08x}"
+            )
+
+        previous_end = header.header_size
+        for index, chunk in enumerate(header.chunks):
+            padding = view[previous_end : chunk.payload_offset]
+            if any(padding):
+                raise CompressedRecordFormatError(
+                    f"non-zero alignment padding before chunks[{index}]"
+                )
+            previous_end = chunk.payload_offset + chunk.compressed_size
+
+        object.__setattr__(self, "header", header)
+        object.__setattr__(self, "record_bytes", data)
+
+
+def validate_complete_record(data: bytes) -> ValidatedCompressedRecord:
+    """Validate one complete record before native decompression.
+
+    Args:
+        data: Exact header, descriptor table, and stored payload bytes.
+
+    Returns:
+        A validated record retaining the supplied immutable bytes without a
+        copy.
+
+    Raises:
+        TypeError: If ``data`` is not immutable :class:`bytes`.
+        CompressedRecordFormatError: If the header, exact record length, or
+            compressed-payload checksum is invalid.
+
+    Notes:
+        CRC-32 detects accidental corruption but does not authenticate
+        attacker-controlled records. Native decompression requires a trusted
+        or independently authenticated source.
+    """
+    return ValidatedCompressedRecord(data)
