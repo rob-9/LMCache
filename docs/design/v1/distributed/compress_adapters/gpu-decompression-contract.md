@@ -8,9 +8,12 @@ under `lmcache/v1/distributed/compress_adapters/`, but no production serde, L2,
 or retrieve path uses them yet.
 
 The undeployed draft wire format now carries a checksum over compressed payload
-bytes and enforces GPU-compatible payload alignment. One prerequisite remains
-before implementing `NvcompBackend`: prove the resulting frozen records against
-the selected nvCOMP and hipCOMP versions.
+bytes and enforces GPU-compatible payload alignment. A standalone compatibility
+probe submits the frozen records to either vendor library. nvCOMP 5.3.0.16
+successfully decompressed both raw-Deflate and Gzip fixtures on an RTX 4060 with
+CUDA 12.9.86. The remaining portability prerequisite is to run the same probe
+against hipCOMP 2.3 on a real AMD GPU host. These small single-chunk fixtures
+establish framing and no-repacking compatibility, not production-scale behavior.
 
 If compatibility with any existing draft record becomes necessary, the wire
 change requires a new record version. Otherwise, version 1 may be revised while
