@@ -27,7 +27,7 @@ buffer:
 
 ```text
 portable record in L1
-  -> compatible device input buffer
+  -> backend-owned exact H2D copy
   -> GpuDecompressBackend
   -> validated contiguous device KV staging
   -> existing paged-KV placement
@@ -116,15 +116,22 @@ never submitted on the strength of caller-asserted alignment metadata.
 
 ## Module ownership
 
-Reusable accelerator values belong under `lmcache/v1/platform/base/`:
+The first interface slice keeps its three accelerator-facing values under
+`lmcache/v1/distributed/compress_adapters/device.py`:
 
 ```text
 DeviceIdentity
-CompatibleDeviceBuffer
+DeviceBufferRange
 DeviceExecutionContext
 ```
 
-Compression-specific values belong under
+They adapt LMCache's platform APIs, but their current lifetime and validation
+rules are specific to native decompression. Moving an interface into
+`platform/base/` would make it a shared platform contract before another
+consumer has demonstrated the same requirements. A later change may promote a
+value unchanged when there is a second use.
+
+The remaining compression-specific values also belong under
 `lmcache/v1/distributed/compress_adapters/`:
 
 ```text
@@ -154,43 +161,52 @@ optional native library can still import LMCache.
 
 ## Shared device values
 
-The following sketches describe semantics, not final Python spelling.
+The three values in this section are the implemented first interface slice.
+They do not submit work or claim ownership of an LMCache allocator slot.
 
 ### Device identity
 
 ```python
-DeviceIdentity(platform_type, runtime, device_index)
+DeviceIdentity(device_type, backend_name, device_index)
 ```
 
-`platform_type` follows LMCache's existing registration, where both CUDA and
-ROCm use the `cuda` `DeviceSpec`. `runtime` distinguishes CUDA from HIP using
-build/runtime evidence such as `torch.version.hip`; it does not introduce a
-competing `hip` platform registration. `device_index` identifies the concrete
-accelerator. Equality requires every field to match.
+`device_type` is Torch's device spelling. `backend_name` comes from the selected
+LMCache `DeviceSpec`, so CUDA and ROCm remain distinct even though both use
+Torch's `cuda` device type. `device_index` is always concrete; an index-free
+accelerator device is resolved through the selected Torch runtime. Equality
+requires every field to match.
 
-### Compatible device buffer
+### Device buffer range
 
 ```python
-CompatibleDeviceBuffer.from_owner(
-    owner,
-    byte_offset,
-    byte_length,
+DeviceBufferRange.from_tensor(
+    tensor,
+    byte_offset=byte_offset,
+    byte_length=byte_length,
 )
 ```
 
-The buffer factory derives device identity and physical capacity from a
-supported public owner API, such as `torch.Tensor.data_ptr()`/`nbytes` or
-`MemoryObj.data_ptr`/`get_physical_size()`. Callers do not provide capacity,
-device, pointer, or alignment claims independently of the owner.
+The first slice deliberately accepts only a contiguous `torch.Tensor`. It
+derives device identity, capacity, and native address from that exact tensor
+view; callers cannot supply those claims independently. The represented range
+may be empty, but it must stay inside `tensor.numel() * tensor.element_size()`.
+`MemoryObj` support is deferred because retaining its Python object does not
+prevent the allocator slot from being freed or reused.
 
 Construction validates `byte_offset + byte_length` with overflow-safe
-arithmetic. A vendor backend maps the owner to its native address and repeats
-capacity, device, and actual `(pointer + offset)` alignment validation before
-submission. This second validation also detects aliasing between distinct
-Python owners of one allocation.
+arithmetic. A vendor backend repeats capacity, device, live address, and actual
+`(pointer + offset)` alignment validation immediately before submission. This
+second validation also detects aliasing between distinct tensor views of one
+allocation.
 
-The descriptor does not transfer allocation ownership. The represented range
-must not be freed, resized, or reused until its completion is finalized.
+The value retains its tensor but is only a range descriptor, not an allocation
+lease. The later request layer must add an explicit output lease so the range
+cannot be resized or reused until its completion is finalized.
+
+Equality and hashing use the snapshotted device, address, capacity, offset, and
+length. The retained tensor is excluded from comparison because Torch equality
+is element-wise, and it is excluded from representations so logging a range
+does not print KV contents.
 
 ### Device execution context
 
@@ -204,8 +220,10 @@ cache context must implement. Only the matching vendor backend translates the
 owner to `cudaStream_t`, `hipStream_t`, or an equivalent native type.
 
 A backend submits on the supplied context and never switches silently to a
-global or default stream. Input H2D work must be enqueued on the same context,
-or that context must first wait on an explicit producer event/completion.
+global or default stream. Input H2D work is enqueued on the same context. The
+adapter retains the context, but cannot prevent another thread from closing it;
+production shutdown must quiesce decompression handlers before closing cache
+contexts or backend resources.
 
 ## Decompression request
 
@@ -214,8 +232,7 @@ One `GpuDecompressItem` represents one parsed portable record:
 ```python
 GpuDecompressItem(
     validated_record,
-    input_buffer,
-    output_buffer,
+    output_lease,
     expected_uncompressed_size,
 )
 ```
@@ -223,13 +240,14 @@ GpuDecompressItem(
 - `validated_record` proves that the complete host record has exact length and
   a valid header plus compressed-payload checksum. Its parsed header supplies
   the metadata below.
-- `input_buffer` begins at record byte zero and has a logical byte length equal
-  to `validated_record.header.record_size`; the H2D copy source is the exact
-  byte view retained by `validated_record`.
+- The backend uploads the exact immutable bytes retained by `validated_record`
+  and owns the resulting device input buffer. A caller cannot pair validated
+  host metadata with unrelated device bytes.
 - `expected_uncompressed_size` comes from the caller's logical KV layout and
   must equal `validated_record.header.uncompressed_size`.
-- `output_buffer.byte_length` must equal `expected_uncompressed_size`; its
-  physical owner capacity may be larger.
+- `output_lease` incorporates a `DeviceBufferRange` whose `byte_length` equals
+  `expected_uncompressed_size`; the lease also prevents allocator reuse until
+  finalization. Its concrete type is part of a later interface slice.
 - Chunk input ranges come from descriptor payload offsets and compressed sizes.
 - Chunk output ranges are consecutive prefix-sum ranges in descriptor order.
 - The backend modifies no byte outside an item's exact output range.
@@ -258,21 +276,24 @@ backend.validate_request(request, execution_context, execution_policy)
 It validates:
 
 - format/version, runtime, device, library, and execution-policy support;
-- input/output/context device identity;
-- owner types and resolved native ranges;
-- actual native pointer alignment;
-- input/output and output/output non-aliasing;
+- leased output and context device identity;
+- output owner types and resolved native ranges;
+- actual output pointer alignment;
+- output/output non-aliasing within the request and across active submissions;
 - chunk, record, aggregate-byte, and active-submission limits;
 - backend- and engine-specific chunk-size limits.
 
-Input/input overlap is permitted because inputs are read-only. Every output
-range is disjoint from all input and output ranges.
+Device inputs do not exist during this advisory validation. `submit_batch()`
+allocates them from the backend-owned compressed-input pool, validates their
+live addresses, alignment, and non-aliasing with every leased output, and then
+enqueues the exact H2D copies. Every leased output is disjoint from all other
+output and input ranges in active submissions.
 
 `GpuDecompressCapabilities` is immutable and reports:
 
 - backend and installed library versions plus stability level;
 - supported `(record version, codec, framing, transform)` combinations;
-- supported platform/runtime/device identities;
+- supported device types, backend names, and concrete device identities;
 - maximum compressed and uncompressed chunk sizes;
 - maximum compression chunks, records, and aggregate bytes per submission;
 - maximum active submissions;
@@ -301,17 +322,18 @@ every item. It fails instead of falling back.
 hipCOMP currently uses HIP compute kernels and therefore does not advertise
 `fixed_function_required`.
 
-## Workspace ownership and concurrency
+## Input, workspace, and concurrency ownership
 
-Native workspace is backend-owned because its layout and lifetime are
-vendor-specific. `required_workspace_size()` remains a pure diagnostic and
-planning operation; callers do not pass the returned allocation to
-`submit_batch()`.
+Compressed device input and native workspace are backend-owned because their
+layout and lifetime are internal to submission. An active submission leases
+distinct aligned ranges from both pools. `required_workspace_size()` remains a
+pure diagnostic and planning operation; callers do not pass the returned
+allocation to `submit_batch()`.
 
-The backend reserves a distinct aligned workspace slot and native descriptor /
-status arrays before its first enqueue. It never reuses them while their
-completion is active. Allocation or backpressure failure occurs before native
-submission.
+The backend reserves an active-submission slot, device input ranges, a distinct
+aligned workspace slot, and native descriptor/status arrays before its first
+enqueue. It never reuses them while their completion is active. Allocation or
+backpressure failure occurs before H2D or native submission.
 
 Backend methods are thread-safe. Capabilities report the maximum active
 submissions; exhausting it raises a deterministic busy error rather than
@@ -371,9 +393,9 @@ stable success or stable validation failure. The `finally` call to
 `wait_and_discard()` is an idempotent safety net for host interruption while a
 wait is in progress.
 
-The completion retains strong references to the request, all buffer owners,
-the execution-context owner, backend, workspace, descriptors, status arrays,
-actual-size arrays, and CRC arrays until finalization.
+The completion retains the request and its output leases, the
+execution-context owner, backend-owned input leases, workspace, descriptors,
+status arrays, actual-size arrays, and CRC arrays until finalization.
 
 ### Completion states
 
@@ -394,16 +416,20 @@ shutdown is safe.
 
 ```text
 1. Load the exact record and verify header plus compressed-payload checksums.
-2. Enqueue an exact-length H2D copy on the selected execution context.
-3. Build a homogeneous request from headers, buffers, and logical KV sizes.
-4. Resolve owners and validate devices, ranges, aliasing, alignment, and limits.
-5. Reserve workspace and native metadata before the first enqueue.
-6. Upload descriptors and submit all non-empty chunk streams on that context.
-7. Compute output CRCs on the same context.
-8. Make status, actual-size, and CRC results host-readable.
-9. Record completion only after every validation result is ready.
-10. Validate every status, output size, and CRC.
-11. Only then enqueue or expose paged-KV placement.
+2. Acquire output leases and build a homogeneous request from validated records
+   and logical KV sizes.
+3. Validate the request, output ranges, execution context, policy, and limits.
+4. Enter `submit_batch()` and repeat validation while taking backend ownership.
+5. Reserve the active-submission slot, device inputs, workspace, and native
+   metadata; validate all live addresses and overlap before the first enqueue.
+6. Enqueue exact-length H2D copies from each validated record on the selected
+   execution context.
+7. Upload descriptors and submit all non-empty chunk streams on that context.
+8. Compute output CRCs on the same context.
+9. Make status, actual-size, and CRC results host-readable.
+10. Record completion only after every validation result is ready.
+11. Validate every status, output size, and CRC.
+12. Only then enqueue or expose paged-KV placement.
 ```
 
 The initial implementation may synchronize the host during validation for
@@ -473,8 +499,9 @@ unchanged.
 
 - `GPUCacheContext` already owns an opaque stream and flat per-object-group
   staging tensors. The output buffer wrapper derives from those tensor views.
-- A later context-owned compressed-input pool supplies exact record-sized input
-  ranges; output reuses existing raw-KV-sized staging.
+- The decompression backend owns a compressed-input pool and leases exact
+  record-sized ranges to active submissions; output reuses existing
+  raw-KV-sized context staging.
 - `SerdeL2AdapterWrapper` later preserves a validated portable record in L1
   instead of always CPU-materializing it.
 - The multiprocess retrieve path classifies raw and deferred representations,
@@ -487,7 +514,8 @@ unchanged.
 
 With the wire integrity/alignment update complete, the interface slice is:
 
-1. Add immutable platform identity, buffer, and execution-context adapters.
+1. Add immutable compression-local device identity, buffer, and
+   execution-context adapters.
 2. Add execution policy, capabilities, item, request, completion, typed errors,
    and backend ABC.
 3. Add fake CUDA and HIP backends using only shared types.
