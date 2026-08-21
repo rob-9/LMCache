@@ -3,6 +3,7 @@
 
 # Standard
 from collections.abc import Callable
+from pathlib import Path
 import hashlib
 import zlib
 
@@ -64,6 +65,10 @@ _V1_GZIP_HELLO_RECORD = bytes.fromhex(
     "00000000"
     "000000000000000000000000"
     "1f8b08000000000000ffcb48cdc9c9070086a6103605000000"
+)
+
+_VENDOR_FIXTURE_DIRECTORY = Path(__file__).with_name("vendor_compatibility") / (
+    "fixtures"
 )
 
 
@@ -228,6 +233,23 @@ def test_decoder_accepts_frozen_version_1_full_records(
     assert header.stored_format == _stored_format(framing)
     assert header.record_size == len(record)
     assert decode_reference_record(record, expected_uncompressed_size=5) == b"hello"
+
+
+@pytest.mark.parametrize(
+    ("filename", "record"),
+    [
+        ("raw-deflate-v1.hex", _V1_RAW_DEFLATE_HELLO_RECORD),
+        ("gzip-v1.hex", _V1_GZIP_HELLO_RECORD),
+    ],
+)
+def test_vendor_probe_fixtures_match_frozen_version_1_records(
+    filename: str,
+    record: bytes,
+) -> None:
+    """Native probes consume the exact records frozen by the Python contract."""
+    fixture_text = (_VENDOR_FIXTURE_DIRECTORY / filename).read_text()
+
+    assert bytes.fromhex(fixture_text) == record
 
 
 @pytest.mark.parametrize(
