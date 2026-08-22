@@ -135,6 +135,8 @@ The remaining compression-specific values also belong under
 `lmcache/v1/distributed/compress_adapters/`:
 
 ```text
+DeviceOutputLease
+DeviceOutputLeaseManager
 GpuDecompressExecutionPolicy
 GpuDecompressCapabilities
 ValidatedCompressedRecord
@@ -225,6 +227,25 @@ adapter retains the context, but cannot prevent another thread from closing it;
 production shutdown must quiesce decompression handlers before closing cache
 contexts or backend resources.
 
+## Output staging leases
+
+```python
+lease_manager = DeviceOutputLeaseManager.for_execution_context(execution_context)
+output_lease = lease_manager.acquire(
+    batch_idx=batch_idx,
+    object_group_idx=object_group_idx,
+    byte_length=expected_uncompressed_size,
+)
+```
+
+The context-keyed factory returns one live thread-safe reservation authority for the compressed-output staging ranges of each cache context; direct manager construction is rejected. The manager derives each range from `cache_context.get_temp_object_group_buffer()` rather than accepting a caller-provided tensor, verifies that it belongs to the execution-context device, and rejects physical overlap with any active lease. Address-based overlap catches aliases created from different tensor views; adjacent half-open ranges are permitted, and empty ranges reserve no writable byte. Each lease retains its `batch_idx` and `object_group_idx` for later placement.
+
+Object-group leases always start at byte offset zero because LMCache's existing paged-placement kernels read from fixed kernel-group bases within that staging slot. `DeviceBufferRange` remains offset-capable for other native-buffer uses, but an offset output would require a separate offset-aware placement contract.
+
+`DeviceOutputLease` is an identity-bearing capability, not another value descriptor. Its manager retains it until explicit release, so dropping a caller reference cannot silently make the range reusable. Release is idempotent but is valid only after every GPU operation that may access the range has completed or been drained. A later `GpuDecompressCompletion` owns that sequencing.
+
+The manager does not intercept code that bypasses it. Existing raw transfer paths reuse fixed `batch_idx` staging slots through same-stream ordering rather than a standalone allocator. Production integration must therefore install one manager per cache context and either serialize raw and compressed staging use or route both through the same reservation authority. Closing a manager with active leases fails instead of abandoning them.
+
 ## Decompression request
 
 One `GpuDecompressItem` represents one parsed portable record:
@@ -245,9 +266,7 @@ GpuDecompressItem(
   host metadata with unrelated device bytes.
 - `expected_uncompressed_size` comes from the caller's logical KV layout and
   must equal `validated_record.header.uncompressed_size`.
-- `output_lease` incorporates a `DeviceBufferRange` whose `byte_length` equals
-  `expected_uncompressed_size`; the lease also prevents allocator reuse until
-  finalization. Its concrete type is part of a later interface slice.
+- `output_lease` incorporates a `DeviceBufferRange` whose `byte_length` equals `expected_uncompressed_size`; the lease also prevents allocator reuse until finalization. It is issued by the cache context's `DeviceOutputLeaseManager`.
 - Chunk input ranges come from descriptor payload offsets and compressed sizes.
 - Chunk output ranges are consecutive prefix-sum ranges in descriptor order.
 - The backend modifies no byte outside an item's exact output range.
@@ -514,16 +533,12 @@ unchanged.
 
 With the wire integrity/alignment update complete, the interface slice is:
 
-1. Add immutable compression-local device identity, buffer, and
-   execution-context adapters.
-2. Add execution policy, capabilities, item, request, completion, typed errors,
-   and backend ABC.
-3. Add fake CUDA and HIP backends using only shared types.
-4. Test intrinsic versus backend validation, owner-derived capacity/alignment,
-   aliasing, device/context mismatch, homogeneous batching, exact logical size,
-   output CRC mismatch, partial enqueue, finalization, concurrency, workspace
-   isolation, shutdown races, and stable failure replay.
-5. Keep real vendor imports and production call sites absent.
+1. Add immutable compression-local device identity, buffer, and execution-context adapters.
+2. Add exclusive output-range leases tied to one execution context.
+3. Add execution policy, capabilities, item, request, completion, typed errors, and backend ABC.
+4. Add fake CUDA and HIP backends using only shared types.
+5. Test intrinsic versus backend validation, owner-derived capacity/alignment, aliasing, device/context mismatch, homogeneous batching, exact logical size, output CRC mismatch, partial enqueue, finalization, concurrency, workspace isolation, shutdown races, and stable failure replay.
+6. Keep real vendor imports and production call sites absent.
 
 ## Vendor constraints informing the contract
 
