@@ -204,6 +204,22 @@ def test_active_manager_survives_dropped_caller_references(
         _acquire(retained_manager)
 
 
+def test_manager_is_collectible_after_last_lease_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The active-manager retention root is removed after final release."""
+    manager = _manager(monkeypatch)
+    manager_reference = weakref.ref(manager)
+    lease = _acquire(manager)
+
+    lease.release()
+    del lease
+    del manager
+    gc.collect()
+
+    assert manager_reference() is None
+
+
 def test_acquire_derives_range_from_context_staging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
