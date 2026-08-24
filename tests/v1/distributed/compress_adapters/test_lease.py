@@ -4,6 +4,8 @@
 # Standard
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+import gc
+import weakref
 
 # Third Party
 import pytest
@@ -68,11 +70,16 @@ class _TestCacheContext:
             raise ValueError("invalid staging slot or object group") from exc
 
 
-class _IncompleteCacheContext:
-    """Context adapter input intentionally lacking the staging-buffer API."""
+class _FailingCacheContext(_TestCacheContext):
+    """Context whose valid staging API raises an internal attribute error."""
 
-    device = torch.device("cpu")
-    stream = object()
+    def get_temp_object_group_buffer(
+        self,
+        batch_idx: int,
+        object_group_idx: int,
+    ) -> torch.Tensor:
+        """Model a context implementation failure after method resolution."""
+        raise AttributeError("staging lookup failed")
 
 
 def _select_spec(
@@ -168,6 +175,33 @@ def test_manager_factory_is_thread_safe(
         managers = list(executor.map(lambda _: resolve_once(), range(worker_count)))
 
     assert all(manager is managers[0] for manager in managers)
+
+
+def test_active_manager_survives_dropped_caller_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cycle collection cannot silently revoke an active reservation."""
+    _select_spec(monkeypatch)
+    context = _TestCacheContext(torch.device("cpu"))
+    execution_context = DeviceExecutionContext.from_cache_context(
+        context  # type: ignore[arg-type]
+    )
+    manager = DeviceOutputLeaseManager.for_execution_context(execution_context)
+    manager_reference = weakref.ref(manager)
+    _acquire(manager)
+
+    del manager
+    gc.collect()
+
+    retained_manager = manager_reference()
+    assert retained_manager is not None
+    assert retained_manager.active_lease_count == 1
+    assert (
+        DeviceOutputLeaseManager.for_execution_context(execution_context)
+        is retained_manager
+    )
+    with pytest.raises(DeviceOutputLeaseUnavailableError, match="overlaps"):
+        _acquire(retained_manager)
 
 
 def test_acquire_derives_range_from_context_staging(
@@ -294,18 +328,19 @@ def test_acquire_validates_slot_and_range_values(
         )
 
 
-def test_acquire_requires_context_staging_api(
+def test_acquire_preserves_error_from_staging_implementation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A device/stream-only object cannot issue a staging reservation."""
+    """An internal context failure is not mislabeled as a missing method."""
     _select_spec(monkeypatch)
+    context = _FailingCacheContext(torch.device("cpu"))
     execution_context = DeviceExecutionContext.from_cache_context(
-        _IncompleteCacheContext()  # type: ignore[arg-type]
+        context  # type: ignore[arg-type]
     )
     manager = DeviceOutputLeaseManager.for_execution_context(execution_context)
 
-    with pytest.raises(TypeError, match="get_temp_object_group_buffer"):
-        _acquire(manager, byte_length=0)
+    with pytest.raises(AttributeError, match="staging lookup failed"):
+        _acquire(manager)
 
 
 def test_acquire_rejects_staging_tensor_on_wrong_device(
