@@ -265,9 +265,8 @@ class DeviceOutputLeaseManager:
             :meth:`DeviceOutputLease.release` is called.
 
         Raises:
-            TypeError: If an index or length has the wrong type, the cache
-                context lacks its public staging-buffer API, or that API does
-                not return a tensor.
+            TypeError: If an index or length has the wrong type or the cache
+                context's public staging-buffer API does not return a tensor.
             ValueError: If an index or length is invalid, the selected staging
                 range is out of bounds, its device differs from the execution
                 context, or its live tensor metadata changes.
@@ -283,17 +282,10 @@ class DeviceOutputLeaseManager:
                 raise DeviceOutputLeaseManagerClosedError(
                     "cannot acquire an output lease from a closed manager"
                 )
-            try:
-                tensor = (
-                    self._execution_context.cache_context.get_temp_object_group_buffer(
-                        batch_idx,
-                        object_group_idx,
-                    )
-                )
-            except AttributeError as exc:
-                raise TypeError(
-                    "cache context must expose public get_temp_object_group_buffer()"
-                ) from exc
+            tensor = self._execution_context.cache_context.get_temp_object_group_buffer(
+                batch_idx,
+                object_group_idx,
+            )
             buffer_range = DeviceBufferRange.from_tensor(
                 tensor,
                 byte_offset=0,
@@ -322,6 +314,8 @@ class DeviceOutputLeaseManager:
             object.__setattr__(lease, "owner", self)
             object.__setattr__(lease, "lease_id", lease_id)
             self._active_leases[lease_id] = lease
+            with _MANAGER_RETENTION_LOCK:
+                _MANAGERS_WITH_ACTIVE_LEASES.add(self)
             return lease
 
     def is_active(self, lease: DeviceOutputLease) -> bool:
@@ -369,6 +363,9 @@ class DeviceOutputLeaseManager:
             if active is not lease:
                 raise ValueError("lease identity does not match active reservation")
             del self._active_leases[lease.lease_id]
+            if not self._active_leases:
+                with _MANAGER_RETENTION_LOCK:
+                    _MANAGERS_WITH_ACTIVE_LEASES.discard(self)
 
     def close(self) -> None:
         """Permanently stop acquisition after all leases are released.
@@ -380,18 +377,18 @@ class DeviceOutputLeaseManager:
         Notes:
             Repeated calls after a successful close are safe.
         """
-        with self._lock:
-            if self._closed:
-                return
-            if self._active_leases:
-                raise DeviceOutputLeaseError(
-                    "cannot close output lease manager with "
-                    f"{len(self._active_leases)} active lease(s)"
-                )
-            self._closed = True
-
         cache_context = self._execution_context.cache_context
         with _MANAGER_REGISTRY_LOCK:
+            with self._lock:
+                if self._closed:
+                    return
+                if self._active_leases:
+                    raise DeviceOutputLeaseError(
+                        "cannot close output lease manager with "
+                        f"{len(self._active_leases)} active lease(s)"
+                    )
+                self._closed = True
+
             manager_reference = _MANAGERS_BY_CONTEXT.get(cache_context)
             if manager_reference is not None and manager_reference() is self:
                 del _MANAGERS_BY_CONTEXT[cache_context]
@@ -399,8 +396,10 @@ class DeviceOutputLeaseManager:
 
 
 _MANAGER_REGISTRY_LOCK = threading.Lock()
+_MANAGER_RETENTION_LOCK = threading.Lock()
 _MANAGERS_BY_CONTEXT: weakref.WeakKeyDictionary[
     object,
     weakref.ReferenceType[DeviceOutputLeaseManager],
 ] = weakref.WeakKeyDictionary()
 _CLOSED_MANAGER_CONTEXTS: weakref.WeakSet[object] = weakref.WeakSet()
+_MANAGERS_WITH_ACTIVE_LEASES: set[DeviceOutputLeaseManager] = set()

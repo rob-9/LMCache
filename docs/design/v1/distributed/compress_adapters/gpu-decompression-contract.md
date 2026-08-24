@@ -33,8 +33,7 @@ portable record in L1
   -> existing paged-KV placement
 ```
 
-The first implementation will use nvCOMP. A hipCOMP implementation must fit
-the same shared interfaces without adding CUDA assumptions to generic code.
+The production feature scope includes both `NvcompBackend` and `HipcompBackend` behind the same shared interfaces. Their implementations may land incrementally, but hipCOMP is an explicit RFC deliverable rather than unspecified follow-up work, and generic code cannot acquire CUDA- or HIP-specific assumptions.
 
 The portable record is the interoperability boundary: it identifies Deflate
 and its framing, not the library that encoded or decodes it. The backend is a
@@ -93,6 +92,8 @@ decompression is disabled for that storage path.
 After decompression, every backend computes CRC-32/IEEE over each output chunk
 and compares it with the descriptor's `uncompressed_crc32`. Native status and
 actual output size alone do not establish content integrity.
+
+Each descriptor's `compressed_size` covers exactly one complete codec stream; producers do not append bytes after that stream's end marker. Structural parsing and the compressed-payload CRC cannot prove codec-stream termination. The reference decoder enforces the rule, while a native backend rejects trailing input when its library reports consumed length or trailing-data status. A backend whose native API cannot report that distinction relies on the trusted-writer boundary and still validates native status, exact output size, and output CRC.
 
 ## Portable alignment policy
 
@@ -244,44 +245,56 @@ Object-group leases always start at byte offset zero because LMCache's existing 
 
 `DeviceOutputLease` is an identity-bearing capability, not another value descriptor. Its manager retains it until explicit release, so dropping a caller reference cannot silently make the range reusable. Release is idempotent but is valid only after every GPU operation that may access the range has completed or been drained. A later `GpuDecompressCompletion` owns that sequencing.
 
+Managers with active leases are strongly retained outside the weak context registry. If callers lose every reference to an active capability, the reservation therefore remains unavailable rather than being reclaimed by cycle collection. Losing the capability leaks the reservation until context shutdown, which is safer than reusing bytes that GPU work may still address.
+
 The manager does not intercept code that bypasses it. Existing raw transfer paths reuse fixed `batch_idx` staging slots through same-stream ordering rather than a standalone allocator. Production integration must therefore install one manager per cache context and either serialize raw and compressed staging use or route both through the same reservation authority. Closing a manager with active leases fails instead of abandoning them.
 
 ## Decompression request
 
-One `GpuDecompressItem` represents one parsed portable record:
+One `GpuDecompressItem` joins one trusted host input with the exact staging destination required by the caller's logical KV layout:
 
 ```python
 GpuDecompressItem(
-    validated_record,
-    output_lease,
-    expected_uncompressed_size,
+    validated_record=validated_record,
+    output_lease=output_lease,
+    expected_uncompressed_size=expected_uncompressed_size,
 )
 ```
 
-- `validated_record` proves that the complete host record has exact length and
-  a valid header plus compressed-payload checksum. Its parsed header supplies
-  the metadata below.
-- The backend uploads the exact immutable bytes retained by `validated_record`
-  and owns the resulting device input buffer. A caller cannot pair validated
-  host metadata with unrelated device bytes.
-- `expected_uncompressed_size` comes from the caller's logical KV layout and
-  must equal `validated_record.header.uncompressed_size`.
-- `output_lease` incorporates a `DeviceBufferRange` whose `byte_length` equals `expected_uncompressed_size`; the lease also prevents allocator reuse until finalization. It is issued by the cache context's `DeviceOutputLeaseManager`.
+- `validated_record` proves that the complete immutable host record has exact length and a valid header plus compressed-payload checksum. The backend later uploads these exact retained bytes, so a caller cannot pair validated metadata with unrelated device input.
+- `expected_uncompressed_size` comes from the caller's logical KV layout and must exactly equal `validated_record.header.uncompressed_size`; stored metadata cannot choose an unbounded or differently sized output.
+- `output_lease` reserves a context-owned `DeviceBufferRange` whose `byte_length` must exactly equal `expected_uncompressed_size`; no native backend is involved in establishing this size equality.
 - Chunk input ranges come from descriptor payload offsets and compressed sizes.
 - Chunk output ranges are consecutive prefix-sum ranges in descriptor order.
 - The backend modifies no byte outside an item's exact output range.
 
-One `GpuDecompressRequest` contains a non-empty tuple of items. Constructors
-validate only backend-independent structure, exact-size equality, checked
-aggregate arithmetic, and one homogeneous `(version, codec, framing,
-transform)` across the request.
+Every request carries explicit caller-selected operational ceilings:
 
-The request also caps total compressed bytes, total uncompressed bytes, record
-count, and flattened compression-chunk count. These are separate concepts and
-must be named separately in errors and metrics.
+```python
+GpuDecompressRequestLimits(
+    max_records=max_records,
+    max_compression_chunks=max_compression_chunks,
+    max_total_record_bytes=max_total_record_bytes,
+    max_total_compressed_payload_bytes=max_total_compressed_payload_bytes,
+    max_total_uncompressed_bytes=max_total_uncompressed_bytes,
+)
+```
 
-Empty records are valid items. They contribute no native chunks; an all-empty
-request returns an already successful completion without calling a vendor API.
+The generic layer intentionally supplies no universal defaults because safe limits depend on the caller's workload and the eventually selected device, vendor library, and execution engine. Request limits provide an early backend-independent bound; a selected backend may advertise and enforce stricter capability limits.
+
+One `GpuDecompressRequest` contains a non-empty tuple of items and the limits applied to that batch:
+
+```python
+GpuDecompressRequest(items=items, limits=limits)
+```
+
+Construction requires every item to use one live `DeviceOutputLeaseManager`, rejects duplicate lease capabilities, and requires one homogeneous `(record version, codec, framing, transform)` across the batch. The single-manager rule means one request maps to one cache context, device, and stream snapshot; it cannot accidentally combine destinations governed by independent reservation authorities.
+
+The request separately exposes and caps `record_count`, flattened `compression_chunk_count`, `total_record_bytes`, `total_compressed_payload_bytes`, and `total_uncompressed_bytes`. Complete record bytes include headers, alignment gaps, and compressed payload because that is the exact host-to-device input footprint; compressed payload bytes count only descriptor-declared streams because that is a distinct codec-work metric. Names remain distinct in errors and future metrics.
+
+Lease activity is time-varying even though the item and request values are frozen. Construction verifies that every lease is active, and `validate_active_leases()` provides the same check at the later submission boundary. The caller must still obey the lease lifecycle contract and not release a reservation until all GPU work and final validation have completed.
+
+Empty records are valid items. They retain a zero-length lease, count as records and complete host headers, but contribute no compression chunks, compressed payload bytes, or output bytes. A later backend returns an already successful completion for an all-empty request without calling a vendor API.
 
 ## Backend validation and capabilities
 
@@ -540,6 +553,8 @@ With the wire integrity/alignment update complete, the interface slice is:
 5. Test intrinsic versus backend validation, owner-derived capacity/alignment, aliasing, device/context mismatch, homogeneous batching, exact logical size, output CRC mismatch, partial enqueue, finalization, concurrency, workspace isolation, shutdown races, and stable failure replay.
 6. Keep real vendor imports and production call sites absent.
 
+After the shared interface slice is accepted, production vendor work adds both `NvcompBackend` and `HipcompBackend`. The hipCOMP backend remains feature-gated and reports upstream experimental stability through capabilities, but it implements the same request, ownership, completion, and validation contract rather than being left as future abstraction-only work.
+
 ## Vendor constraints informing the contract
 
 - nvCOMP warns that corrupt Deflate/Gzip input can produce undefined behavior;
@@ -548,9 +563,7 @@ With the wire integrity/alignment update complete, the interface slice is:
   stricter portable 16-byte policy.
 - nvCOMP's default engine may fall back from fixed-function hardware to CUDA
   kernels, motivating explicit execution policy.
-- hipCOMP 2.3 has compatible batched asynchronous Deflate/Gzip concepts but
-  labels them experimental and unsuitable for production workloads. Initial
-  HIP support remains feature-gated and reports that stability in capabilities.
+- hipCOMP 2.3 has compatible batched asynchronous Deflate/Gzip concepts but labels them experimental and unsuitable for production workloads. The RFC still includes a feature-gated implementation, which reports that stability honestly in capabilities.
 
 Primary references:
 
@@ -566,8 +579,7 @@ Primary references:
 - Production compression chunk size, subject to the 16-byte alignment policy.
 - Initial CPU/QAT/IAA store-side encoder.
 - Pinned nvCOMP and hipCOMP versions and exact common capability set.
-- Whether the first AMD deliverable is interface conformance, an experimental
-  backend, or complete hardware end-to-end coverage.
+- Exact feature-gating and user-facing stability language for the initial hipCOMP backend.
 
 These choices do not weaken the integrity, ownership, submission, or completion
 semantics above.

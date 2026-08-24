@@ -242,6 +242,12 @@ class CompressedChunkDescriptor:
         TypeError: If a field is not an integer.
         ValueError: If a field is outside its wire-format range or either size
             is zero.
+
+    Notes:
+        ``compressed_size`` covers exactly one complete codec stream. A
+        producer must not include bytes after that stream's end marker. This
+        semantic property is checked by a decoder rather than by structural
+        header parsing.
     """
 
     payload_offset: int
