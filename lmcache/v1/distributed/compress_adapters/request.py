@@ -174,11 +174,15 @@ class GpuDecompressRequest:
 
     items: tuple[GpuDecompressItem, ...]
     limits: GpuDecompressRequestLimits
-    _record_count: int = field(init=False, repr=False)
-    _compression_chunk_count: int = field(init=False, repr=False)
-    _total_record_bytes: int = field(init=False, repr=False)
-    _total_compressed_payload_bytes: int = field(init=False, repr=False)
-    _total_uncompressed_bytes: int = field(init=False, repr=False)
+    _record_count: int = field(init=False, repr=False, compare=False)
+    _compression_chunk_count: int = field(init=False, repr=False, compare=False)
+    _total_record_bytes: int = field(init=False, repr=False, compare=False)
+    _total_compressed_payload_bytes: int = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _total_uncompressed_bytes: int = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.items, tuple):

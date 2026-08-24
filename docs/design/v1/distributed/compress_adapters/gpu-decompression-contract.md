@@ -321,23 +321,19 @@ live addresses, alignment, and non-aliasing with every leased output, and then
 enqueues the exact H2D copies. Every leased output is disjoint from all other
 output and input ranges in active submissions.
 
-`GpuDecompressCapabilities` is immutable and reports:
+`SupportedCompressedRecordFormat` makes each supported `(record version, codec, framing, transform)` identity explicit and hashable. `GpuDecompressCapabilities` is an immutable profile for one concrete `DeviceIdentity`, not a vendor-wide promise across heterogeneous GPUs. A future backend resolves the profile for the supplied execution context so device- and engine-specific limits remain accurate.
 
-- backend and installed library versions plus stability level;
-- supported `(record version, codec, framing, transform)` combinations;
-- supported device types, backend names, and concrete device identities;
-- maximum compressed and uncompressed chunk sizes;
-- maximum compression chunks, records, and aggregate bytes per submission;
-- maximum active submissions;
-- input, output, and workspace alignment;
-- asynchronous behavior and supported execution policies.
+The profile reports `decompress_backend_name` (for example `nvcomp` or `hipcomp`) separately from `device.backend_name` (for example `cuda` or `rocm`), plus the installed library name and opaque version, conservative stable or experimental status, supported record identities and execution policies, maximum compressed and uncompressed chunk bytes, maximum records and flattened chunks, separate aggregate complete-record, compressed-payload, and uncompressed-output bytes, maximum active submissions, native input/output/workspace alignments, and asynchronous behavior.
 
-Limits are conservative values for the selected device, native library, and
-execution engine. They are not universal constants copied from one vendor.
+All maximums and alignments are positive, and aggregate payload/output capacities cannot be smaller than their related per-chunk maximum. The complete-record capacity must at least contain the compressed bytes of one maximum-size chunk, but this is only a lower-bound consistency check; later request validation accounts for the selected record version's header and alignment overhead. Per-chunk capability maxima are not globally capped to version 1's uint32 fields because a profile may describe future record versions, while the active parser already enforces the wire bounds of every constructed request. Alignments are not assumed to be powers of two because shared validation can use modulo arithmetic. Limits have no generic defaults: concrete backends derive conservative values for the selected device, installed native library, and execution engine.
+
+Capability query helpers answer whether the profile supports an exact record identity, execution policy, or device. They reject wrong argument types, return `False` for integer record versions outside the unsigned-byte format domain, and otherwise return booleans; typed unsupported-request failures belong to the later backend validation contract.
+
+`is_asynchronous=False` means device work is complete when submission returns; it never exempts a caller from validating or discarding the returned completion. Both synchronous and asynchronous profiles use the same finalization contract so validation results and owned resources are released consistently.
 
 ## Execution policy
 
-The initial policies are:
+The execution-policy values are:
 
 ```text
 any_gpu_engine
@@ -345,14 +341,11 @@ software_gpu_required
 fixed_function_required
 ```
 
-nvCOMP may use CUDA kernels or Blackwell's fixed-function Decompression Engine.
-Its default selection may fall back to CUDA kernels. When fixed-function work
-is required, `NvcompBackend` selects the strict hardware mode and validates
-device support, dynamically queried chunk limits, and allocation provenance for
-every item. It fails instead of falling back.
+`any_gpu_engine` lets the backend choose any supported GPU engine but never permits CPU fallback. `software_gpu_required` requires ordinary CUDA/HIP compute execution and forbids silent fixed-function selection. `fixed_function_required` requires a dedicated hardware decompressor and forbids software fallback.
 
-hipCOMP currently uses HIP compute kernels and therefore does not advertise
-`fixed_function_required`.
+nvCOMP may use CUDA kernels or Blackwell's fixed-function Decompression Engine. Its default selection may fall back to CUDA kernels. When fixed-function work is required, `NvcompBackend` selects the strict hardware mode and validates device support, dynamically queried chunk limits, and allocation provenance for every item. It fails instead of falling back.
+
+hipCOMP currently uses HIP compute kernels and therefore advertises `any_gpu_engine` and `software_gpu_required`, but not `fixed_function_required`. Its initial Deflate/Gzip profile reports experimental stability while upstream marks those APIs experimental.
 
 ## Input, workspace, and concurrency ownership
 
